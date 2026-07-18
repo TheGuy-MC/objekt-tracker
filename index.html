@@ -12513,8 +12513,12 @@ var qrcode = function() {
   .qrCode{font:11px var(--mono);color:#555;word-break:break-all;margin-top:2px}
   .qrDl{display:inline-block;margin-top:6px;font-size:12px;color:#087f5b}
   .genActions{padding:0 14px 20px}
-  .genActions .ghost{background:none;border:1px solid var(--line);color:var(--muted);
+  .genActions .ghost,.calBtn{background:none;border:1px solid var(--line);color:var(--muted);
     border-radius:4px;padding:10px 18px;font-size:14px;cursor:pointer}
+  .genBox select{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:4px;
+    color:var(--text);font-size:15px;padding:10px 12px}
+  .hint{font-size:12px;color:var(--muted);line-height:1.5;margin:6px 0 10px}
+  .calBtn{margin-bottom:6px}
   @media print{
     body{overflow:visible;background:#fff}
     body>*{display:none!important}
@@ -12597,11 +12601,27 @@ var qrcode = function() {
             <input id="genObjName" placeholder="z.B. bohrmaschine">
           </div>
         </div>
+        <label class="radioRow"><input type="checkbox" id="genMeas" checked> Messung aktivieren (Entfernung + Winkel)</label>
+        <div id="genMeasWrap">
+          <label for="genMeasSize">Druckgr\u00f6\u00dfe des Codes (Kantenl\u00e4nge)</label>
+          <select id="genMeasSize">
+            <option value="5">5 cm</option>
+            <option value="10" selected>10 cm</option>
+            <option value="15">15 cm</option>
+            <option value="20">20 cm</option>
+          </select>
+        </div>
         <button class="btn" id="genBtn">Erzeugen</button>
       </div>
       <div id="genOutput"></div>
       <div class="genActions" id="genActions" style="display:none">
         <button class="ghost" id="printBtn">Drucken</button>
+      </div>
+      <div class="sectionHead">Kamera-Kalibrierung</div>
+      <div class="genBox">
+        <div class="hint">F\u00fcr genaue Entfernungen: einen Mess-Code in genau <b>50 cm</b> Abstand mittig scannen. Ohne Kalibrierung wird ein Standardwert genutzt (ungenauer).</div>
+        <button class="ghost calBtn" id="calibBtn">Kalibrier-Modus starten</button>
+        <div class="hint" id="calibState"></div>
       </div>
     </div>
   </div>
@@ -12616,7 +12636,7 @@ var qrcode = function() {
 
 <footer>
   <span>KAMO</span>
-  <span>v1.1</span>
+  <span>v1.2</span>
 </footer>
 
 <!-- Modal für Objekt-Benennung -->
@@ -12675,10 +12695,13 @@ var qrcode = function() {
     if(!navigator.geolocation){ $('gpsBadge').textContent='kein GPS'; return; }
     navigator.geolocation.watchPosition(p=>{
       pos={lat:p.coords.latitude,lng:p.coords.longitude,acc:p.coords.accuracy};
-      $('gpsBadge').textContent='GPS ±'+Math.round(pos.acc)+'m';
+      $('gpsBadge').textContent='GPS \u00b1'+Math.round(pos.acc)+'m';
       $('gpsBadge').classList.add('ok');
-    },err=>{ $('gpsBadge').textContent='GPS-Fehler'; $('gpsBadge').classList.remove('ok');
-    },{enableHighAccuracy:true,maximumAge:1000,timeout:15000});
+    },err=>{
+      $('gpsBadge').classList.remove('ok');
+      if(err.code===1) $('gpsBadge').textContent='GPS verweigert';
+      else $('gpsBadge').textContent='GPS sucht \u2026'; // Timeout/unavailable: einfach weiter warten
+    },{enableHighAccuracy:true,maximumAge:2000});
   }
 
   // ---------- Kompass ----------
@@ -12702,8 +12725,32 @@ var qrcode = function() {
     return [x,y];
   }
 
+  // ---------- Messung (Entfernung + Winkel aus Markergröße) ----------
+  let focal=parseFloat(localStorage.getItem('kamo_objtracker_focal'))||null; // normiert auf Bildbreite
+  let calibMode=false, fix=null; // fix = präzise Position aus Anker-Messung
+  function measure(loc,cm,imgW){
+    const d=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+    const side=(d(loc.topLeftCorner,loc.topRightCorner)+d(loc.topRightCorner,loc.bottomRightCorner)
+               +d(loc.bottomRightCorner,loc.bottomLeftCorner)+d(loc.bottomLeftCorner,loc.topLeftCorner))/4;
+    const f=(focal||0.9)*imgW; // 0.9 ~ 58 Grad hFOV als Default, kalibrierbar
+    const dist=(f*(cm/100))/side;
+    const cx=(loc.topLeftCorner.x+loc.topRightCorner.x+loc.bottomRightCorner.x+loc.bottomLeftCorner.x)/4;
+    const bearing=(heading+Math.atan2(cx-imgW/2,f)*180/Math.PI+360)%360;
+    return {dist,bearing,side};
+  }
+  function offsetLatLng(lat,lng,dist,bearing){
+    const dx=dist*Math.sin(bearing*Math.PI/180), dy=dist*Math.cos(bearing*Math.PI/180);
+    return {lat:lat+dy/110540, lng:lng+dx/(111320*Math.cos(lat*Math.PI/180))};
+  }
+  function phonePos(){
+    if(fix && Date.now()-fix.time<30000) return fix; // Anker-Fix gilt 30s
+    return pos;
+  }
+  function fmtDist(m){return m<1?Math.round(m*100)+' cm':(Math.round(m*10)/10).toLocaleString('de-DE')+' m';}
+
   // ---------- QR-Parsing ----------
   const CORNER_RE=/^(.+)_corner_([xy])$/i;
+  const ANCHOR_RE=/^(.+)_anchor$/i;
   const NUM_RE=/^(\d{5})_(.+)$/;
 
   function toast(html){
@@ -12728,26 +12775,70 @@ var qrcode = function() {
     modalResolve && modalResolve(null); modalResolve=null; });
   $('modalInput').addEventListener('keydown',e=>{ if(e.key==='Enter') $('modalOk').click(); });
 
-  let lastAccept=0, lastBox=null, modalBusy=false;
+  const acceptAt=new Map(); // Cooldown pro Code -> Multiscan möglich
+  let boxes=[], modalBusy=false;
 
-  async function handleCode(code, location){
-    lastBox={location,until:performance.now()+400};
+  async function handleCode(raw, location){
+    // Mess-Suffix ~<cm> abtrennen
+    let code=raw, cm=null, t=raw.match(/^(.*)~(\d+(?:\.\d+)?)$/);
+    if(t){ code=t[1]; cm=parseFloat(t[2]); }
+
+    // Messung (falls Marker-Größe im Code steckt)
+    let meas=null;
+    if(cm && video.videoWidth) meas=measure(location,cm,video.videoWidth);
+    boxes.push({location,until:performance.now()+400,label:meas?fmtDist(meas.dist):null});
+
     if(modalBusy) return;
-    if(performance.now()-lastAccept < COOLDOWN_MS) return;
-    lastAccept=performance.now();
+    if(performance.now()-(acceptAt.get(code)||0) < COOLDOWN_MS) return;
+    acceptAt.set(code,performance.now());
 
-    if(!pos){ toast('Kein GPS-Fix — Code erkannt, aber Position fehlt noch.'); beepUpdate(); return; }
+    // Kalibrierung: Marker in 50 cm Abstand
+    if(calibMode && meas){
+      focal=(meas.side*0.5/(cm/100))/video.videoWidth;
+      localStorage.setItem('kamo_objtracker_focal',focal);
+      calibMode=false; updateCalibUI();
+      beepNew(); toast('Kamera kalibriert (f = '+focal.toFixed(2)+' \u00d7 Bildbreite).');
+      return;
+    }
+
+    const p=phonePos();
+    // Zielposition: mit Messung = Handyposition + Distanz in Blickrichtung, sonst Handyposition.
+    // Ohne GPS-Fix wird trotzdem gespeichert (Position leer, nachscannbar).
+    const target=p?(meas?offsetLatLng(p.lat,p.lng,meas.dist,meas.bearing):{lat:p.lat,lng:p.lng})
+                  :{lat:null,lng:null};
+    const measTag=(meas?' \u00b7 '+fmtDist(meas.dist)+' / '+Math.round(meas.bearing)+'\u00b0':'')+
+                  (p?'':' \u00b7 ohne Position (kein GPS)');
 
     let m;
-    if(m=code.match(CORNER_RE)){
+    if(m=code.match(ANCHOR_RE)){
+      // ----- Anker: fixer Referenz-QR im Raum -----
+      const room=m[1].toLowerCase();
+      if(!meas){ toast('Anker erkannt, aber ohne Gr\u00f6\u00dfenangabe (~cm) nicht messbar.'); beepUpdate(); return; }
+      if(!p){ toast('Anker erkannt — warte aber noch auf GPS f\u00fcr die erste Verortung.'); beepUpdate(); return; }
+      if(!db.anchors) db.anchors={};
+      if(!db.anchors[room]){
+        db.anchors[room]={lat:target.lat,lng:target.lng,cm};
+        save(); beepNew();
+        toast('Anker f\u00fcr <b>'+room+'</b> gesetzt'+measTag+'. Ab jetzt verortet sich das Handy daran.');
+      } else {
+        // Handyposition r\u00fcckw\u00e4rts aus dem Anker bestimmen -> pr\u00e4ziser Fix
+        const a=db.anchors[room];
+        const me=offsetLatLng(a.lat,a.lng,meas.dist,(meas.bearing+180)%360);
+        fix={lat:me.lat,lng:me.lng,time:Date.now()};
+        beepUpdate();
+        toast('Position am Anker <b>'+room+'</b> korrigiert ('+fmtDist(meas.dist)+' entfernt).');
+      }
+    }
+    else if(m=code.match(CORNER_RE)){
       // ----- Raum-Ecke -----
       const room=m[1].toLowerCase(), corner=m[2].toLowerCase();
+      const isNew=!(db.rooms[room]&&db.rooms[room][corner]);
       db.rooms[room]=db.rooms[room]||{};
-      db.rooms[room][corner]={lat:pos.lat,lng:pos.lng};
-      save(); beepRoom();
+      db.rooms[room][corner]={lat:target.lat,lng:target.lng};
+      save(); isNew?beepNew():beepUpdate();
       const complete = db.rooms[room].x && db.rooms[room].y;
-      toast('Ecke <b>'+corner.toUpperCase()+'</b> von <b>'+room+'</b> gespeichert.'+
-        (complete?' Raum ist komplett und erscheint auf der Karte.':' Scanne noch die andere Ecke.'));
+      toast('Ecke <b>'+corner.toUpperCase()+'</b> von <b>'+room+'</b> gespeichert'+measTag+'.'+
+        (complete?' Raum ist komplett.':' Scanne noch die andere Ecke.'));
     }
     else if(m=code.match(NUM_RE)){
       // ----- Nummeriertes Objekt: 12345_zimmer -----
@@ -12757,14 +12848,14 @@ var qrcode = function() {
         const name=await askName(code);
         modalBusy=false;
         if(!name){ toast('Abgebrochen — Objekt nicht gespeichert.'); return; }
-        db.objects[code]={name,room,id,lat:pos.lat,lng:pos.lng,seen:Date.now()};
+        db.objects[code]={name,room,id,lat:target.lat,lng:target.lng,seen:Date.now(),measured:!!meas};
         save(); beepNew();
-        toast('Neues Objekt <b>'+name+'</b> ('+room+') gespeichert.');
+        toast('Neues Objekt <b>'+name+'</b> ('+room+') gespeichert'+measTag+'.');
       } else {
         const o=db.objects[code];
-        o.lat=pos.lat;o.lng=pos.lng;o.seen=Date.now();
+        o.lat=target.lat;o.lng=target.lng;o.seen=Date.now();o.measured=!!meas;
         save(); beepUpdate();
-        toast('Position von <b>'+o.name+'</b> aktualisiert.');
+        toast('Position von <b>'+o.name+'</b> aktualisiert'+measTag+'.');
       }
     }
     else {
@@ -12773,10 +12864,10 @@ var qrcode = function() {
       const room=i>0?code.slice(0,i).toLowerCase():null;
       const name=i>0?code.slice(i+1):code;
       const isNew=!db.objects[code];
-      db.objects[code]={...(db.objects[code]||{}),name,room,lat:pos.lat,lng:pos.lng,seen:Date.now()};
+      db.objects[code]={...(db.objects[code]||{}),name,room,lat:target.lat,lng:target.lng,seen:Date.now(),measured:!!meas};
       save();
-      if(isNew){ beepNew(); toast('Objekt <b>'+name+'</b>'+(room?' ('+room+')':'')+' gespeichert.'); }
-      else { beepUpdate(); toast('Position von <b>'+name+'</b> aktualisiert.'); }
+      if(isNew){ beepNew(); toast('Objekt <b>'+name+'</b>'+(room?' ('+room+')':'')+' gespeichert'+measTag+'.'); }
+      else { beepUpdate(); toast('Position von <b>'+name+'</b> aktualisiert'+measTag+'.'); }
     }
     renderLists();
   }
@@ -12786,15 +12877,53 @@ var qrcode = function() {
   let worker=null, workerBusy=false, decodeScale=1, frameCount=0;
   function startWorker(){
     const lib=document.getElementById('jsqrlib').textContent;
-    const src=lib+"\nself.onmessage=function(e){var d=e.data;"+
-      "var c=jsQR(new Uint8ClampedArray(d.buf),d.w,d.h,{inversionAttempts:d.inv?'attemptBoth':'dontInvert'});"+
-      "postMessage(c?{data:c.data,location:c.location}:null);};";
+    // Multiscan: Vollbild zuerst; wenn mehrere Codes sich gegenseitig blockieren,
+    // trennen überlappende Teilregionen (Hälften) sie. Gefundene werden maskiert.
+    const workerBody=`
+      var K=['topLeftCorner','topRightCorner','bottomRightCorner','bottomLeftCorner'];
+      function crop(buf,W,x0,y0,w,h){
+        var out=new Uint8ClampedArray(w*h*4);
+        for(var y=0;y<h;y++) out.set(buf.subarray(((y0+y)*W+x0)*4,((y0+y)*W+x0+w)*4), y*w*4);
+        return out;
+      }
+      function mask(buf,W,H,l){
+        var xs=K.map(function(k){return l[k].x}),ys=K.map(function(k){return l[k].y});
+        var x0=Math.max(0,Math.floor(Math.min.apply(0,xs))-4),x1=Math.min(W-1,Math.ceil(Math.max.apply(0,xs))+4);
+        var y0=Math.max(0,Math.floor(Math.min.apply(0,ys))-4),y1=Math.min(H-1,Math.ceil(Math.max.apply(0,ys))+4);
+        for(var y=y0;y<=y1;y++){var off=y*W*4;for(var x=x0;x<=x1;x++){var p=off+x*4;buf[p]=buf[p+1]=buf[p+2]=255;}}
+      }
+      function shift(l,dx,dy){var o={};K.forEach(function(k){o[k]={x:l[k].x+dx,y:l[k].y+dy}});return o;}
+      self.onmessage=function(e){
+        var d=e.data,W=d.w,H=d.h,buf=new Uint8ClampedArray(d.buf);
+        var opts={inversionAttempts:d.inv?'attemptBoth':'dontInvert'};
+        var found=[],seen={};
+        var w6=(W*0.6)|0,h6=(H*0.6)|0;
+        var regions=[[0,0,W,H],[0,0,w6,H],[W-w6,0,w6,H],[0,0,W,h6],[0,H-h6,W,h6]];
+        for(var pass=0;pass<6&&found.length<6;pass++){
+          var hit=false;
+          for(var ri=0;ri<regions.length;ri++){
+            var x0=regions[ri][0],y0=regions[ri][1],w=regions[ri][2],h=regions[ri][3];
+            var sub=(ri===0)?buf:crop(buf,W,x0,y0,w,h);
+            var c=jsQR(sub,w,h,opts);
+            if(c&&c.data&&!seen[c.data]){
+              seen[c.data]=1;
+              var loc=shift(c.location,x0,y0);
+              found.push({data:c.data,location:loc});
+              mask(buf,W,H,loc);
+              hit=true;break;
+            }
+          }
+          if(!hit)break;
+        }
+        postMessage(found);
+      };`;
+    const src=lib+"\n"+workerBody;
     worker=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
     worker.onmessage=e=>{
       workerBusy=false;
-      const c=e.data;
-      if(c&&c.data){
-        const inv=1/decodeScale;
+      const inv=1/decodeScale;
+      boxes=[];
+      for(const c of e.data){
         for(const k of ['topLeftCorner','topRightCorner','bottomRightCorner','bottomLeftCorner'])
           c.location[k]={x:c.location[k].x*inv,y:c.location[k].y*inv};
         handleCode(c.data.trim(),c.location);
@@ -12826,16 +12955,27 @@ var qrcode = function() {
     pumpFrame();
     // Rahmen zeichnen (object-fit:cover -> Skalierung/Crop beachten)
     octx.clearRect(0,0,overlay.width,overlay.height);
-    if(lastBox && performance.now()<lastBox.until && video.videoWidth){
+    if(video.videoWidth){
       const vw=video.videoWidth,vh=video.videoHeight;
       const scale=Math.max(overlay.width/vw,overlay.height/vh);
       const ox=(overlay.width-vw*scale)/2, oy=(overlay.height-vh*scale)/2;
       const P=p=>[p.x*scale+ox,p.y*scale+oy];
-      const l=lastBox.location;
-      const pts=[l.topLeftCorner,l.topRightCorner,l.bottomRightCorner,l.bottomLeftCorner].map(P);
-      octx.lineWidth=4;octx.strokeStyle='#3ddc97';octx.shadowColor='#3ddc97';octx.shadowBlur=10;
-      octx.beginPath();pts.forEach((p,i)=>i?octx.lineTo(p[0],p[1]):octx.moveTo(p[0],p[1]));
-      octx.closePath();octx.stroke();octx.shadowBlur=0;
+      for(const b of boxes){
+        if(performance.now()>=b.until) continue;
+        const l=b.location;
+        const pts=[l.topLeftCorner,l.topRightCorner,l.bottomRightCorner,l.bottomLeftCorner].map(P);
+        octx.lineWidth=4;octx.strokeStyle='#3ddc97';octx.shadowColor='#3ddc97';octx.shadowBlur=10;
+        octx.beginPath();pts.forEach((p,i)=>i?octx.lineTo(p[0],p[1]):octx.moveTo(p[0],p[1]));
+        octx.closePath();octx.stroke();octx.shadowBlur=0;
+        if(b.label){
+          const tx=(pts[0][0]+pts[1][0])/2, ty=Math.min(pts[0][1],pts[1][1])-10;
+          octx.font='600 15px sans-serif';octx.textAlign='center';
+          octx.fillStyle='rgba(4,21,13,.85)';
+          const w=octx.measureText(b.label).width;
+          octx.fillRect(tx-w/2-7,ty-19,w+14,24);
+          octx.fillStyle='#3ddc97';octx.fillText(b.label,tx,ty-1);
+        }
+      }
     }
   }
 
@@ -12903,6 +13043,7 @@ var qrcode = function() {
     // Objekte
     mctx.font='600 12px sans-serif';mctx.textAlign='center';
     for(const o of Object.values(db.objects)){
+      if(o.lat==null) continue;
       const s=toScreen(o.lat,o.lng);
       mctx.beginPath();mctx.arc(s[0],s[1],6,0,7);
       mctx.fillStyle='#3ddc97';mctx.fill();
@@ -12953,7 +13094,7 @@ var qrcode = function() {
       const el=document.createElement('div');el.className='obj';
       const d=new Date(o.seen).toLocaleString('de-DE');
       el.innerHTML='<div class="info"><div class="name">'+(o.room?'<span class="roomTag">'+o.room+'</span>':'')+o.name+'</div>'+
-        '<div class="sub">'+code+' · zuletzt '+d+'</div></div>';
+        '<div class="sub">'+code+' \u00b7 zuletzt '+d+(o.lat==null?' \u00b7 ohne Position':'')+'</div></div>';
       const ren=document.createElement('button');ren.textContent='Umbenennen';
       ren.addEventListener('click',async()=>{ modalBusy=true;const n=await askName(code);modalBusy=false;
         if(n){o.name=n;save();renderLists();} });
@@ -13010,29 +13151,48 @@ var qrcode = function() {
     dl.href=c.toDataURL('image/png');dl.download=text+'.png';wrap.appendChild(dl);
     $('genOutput').appendChild(wrap);
   }
+  $('genMeas').addEventListener('change',()=>{
+    $('genMeasWrap').style.display=$('genMeas').checked?'block':'none';
+  });
   $('genBtn').addEventListener('click',()=>{
     $('genOutput').innerHTML='';
+    const meas=$('genMeas').checked;
+    const size=$('genMeasSize').value;
+    const suf=meas?'~'+size:'';
+    const sizeNote=meas?' (auf '+size+' cm drucken!)':'';
     if(genMode==='room'){
       const r=slug($('genRoomName').value);
       if(!r){alert('Raumname fehlt.');return;}
-      drawQR(r+'_corner_x','Ecke X \u2014 '+r);
-      drawQR(r+'_corner_y','Ecke Y \u2014 '+r);
+      drawQR(r+'_corner_x'+suf,'Ecke X \u2014 '+r+sizeNote);
+      drawQR(r+'_corner_y'+suf,'Ecke Y \u2014 '+r+sizeNote);
+      if(meas) drawQR(r+'_anchor'+suf,'Anker \u2014 '+r+' (frei im Raum platzieren)'+sizeNote);
     }else{
       const room=slug($('genObjRoom').value);
       if(!room){alert('Zimmer fehlt.');return;}
       const mode=document.querySelector('input[name=objMode]:checked').value;
       if(mode==='num'){
         const num=String(Math.floor(10000+Math.random()*90000));
-        drawQR(num+'_'+room,'Objekt '+num+' \u2014 '+room);
+        drawQR(num+'_'+room+suf,'Objekt '+num+' \u2014 '+room+sizeNote);
       }else{
         const name=slug($('genObjName').value);
         if(!name){alert('Objektname fehlt.');return;}
-        drawQR(room+'_'+name,name+' \u2014 '+room);
+        drawQR(room+'_'+name+suf,name+' \u2014 '+room+sizeNote);
       }
     }
     $('genActions').style.display='flex';
   });
   $('printBtn').addEventListener('click',()=>window.print());
+
+  // ---------- Kalibrier-UI ----------
+  function updateCalibUI(){
+    $('calibBtn').textContent=calibMode?'Kalibrier-Modus abbrechen':'Kalibrier-Modus starten';
+    $('calibState').textContent=calibMode
+      ?'Aktiv: jetzt im Scanner-Tab einen Mess-Code in 50 cm Abstand scannen.'
+      :(focal?'Kalibriert (f = '+focal.toFixed(2)+' \u00d7 Bildbreite).'
+             :'Noch nicht kalibriert.');
+  }
+  $('calibBtn').addEventListener('click',()=>{ calibMode=!calibMode; updateCalibUI(); });
+  updateCalibUI();
 
   mapLoop();
   renderLists();
